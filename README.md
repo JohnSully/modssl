@@ -7,14 +7,16 @@ modssl is based upon a PR by madolson for [adding SSL support to Redis](https://
 ## Checkout and Compile
 Compiling modssl requires the sources for the version of Redis or KeyDB which you intend to use it with.  Because modssl integrates more tightly than a regular module it may only be used with the exact version it was compiled with.
 
-For Redis:
+First clone the repo (and submodules):
 
     git clone --recurse-submodules https://github.com/JohnSully/modssl.git 
+
+For Redis:
+
     make REDIS_SRC=/path/to/redis/src
    
 For KeyDB:
 
-    git clone --recurse-submodules https://github.com/JohnSully/modssl.git 
     make REDIS_SRC=/path/to/redis/src KEYDB=1
     
 # Running
