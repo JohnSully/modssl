@@ -36,6 +36,32 @@
 #include <stdlib.h>
 #include <inttypes.h>
 
+ssl_t g_ssl_config;
+
+/* Return the file proc for a file descriptor and given event
+ * (AE_READABLE or AE_WRITABLE) or null if one does not exist. */
+aeFileProc* aeGetFileProc(aeEventLoop *eventLoop, int fd, int event) {
+    if (fd >= eventLoop->setsize) return NULL;
+    aeFileEvent *fe = &eventLoop->events[fd];
+
+    if (event == AE_READABLE) {
+        return fe->rfileProc;
+    } else if (event == AE_WRITABLE) {
+        return fe->wfileProc;
+    }
+
+    return NULL;
+}
+
+/* Return the client data associated with a file descriptor,
+ * or null if it does not exist. */
+void* aeGetClientData(aeEventLoop *eventLoop, int fd) {
+    if (fd >= eventLoop->setsize) return NULL;
+    aeFileEvent *fe = &eventLoop->events[fd];
+
+    return fe->clientData;
+}
+
 /* =============================================================================
  * SSL independent helper functions
  * ==========================================================================*/
@@ -52,7 +78,7 @@ int getSslPerformanceModeByName(char *name) {
 /**
  * Converts SSL performance mode integer to corresponding str
  */
-char *getSslPerformanceModeStr(int mode) {
+const char *getSslPerformanceModeStr(int mode) {
     if (mode == SSL_PERFORMANCE_MODE_LOW_LATENCY) return "low-latency";
     else if (mode == SSL_PERFORMANCE_MODE_HIGH_THROUGHPUT) return "high-throughput";
     else return "invalid input";
@@ -83,8 +109,6 @@ void initSslConfigDefaults(ssl_t *ssl_config) {
     ssl_config->ssl_dh_params_file = NULL;
     ssl_config->ssl_cipher_prefs = SSL_CIPHER_PREFS_DEFAULT;
     ssl_config->ssl_performance_mode = SSL_PERFORMANCE_MODE_DEFAULT;
-    ssl_config->fd_to_sslconn = NULL;
-    ssl_config->fd_to_sslconn_size = 0;
     ssl_config->root_ca_certs_path = NULL;
     ssl_config->sslconn_with_cached_data = NULL;
     ssl_config->repeated_reads_task_id = AE_ERR;
@@ -119,16 +143,16 @@ static ssl_connection * getSslConnectionForFd(int fd);
 
 /* SSL IO primitive functions */
 static ssize_t sslRecv(int fd, void *buffer, size_t nbytes, s2n_blocked_status * blocked);
-static ssize_t sslRead(int fd, void *buffer, size_t nbytes);
-static ssize_t sslWrite(int fd, const void *buffer, size_t nbytes);
-static int sslClose(int fd);
-static void sslPing(int fd);
-static const char *sslStrerror(int err);
+ssize_t sslRead(int fd, void *buffer, size_t nbytes);
+ssize_t sslWrite(int fd, const void *buffer, size_t nbytes);
+int sslClose(int fd);
+void sslPing(int fd);
+const char *sslStrerror(int err);
 
 /* Functions for normal SSL negotiations */
 static SslNegotiationStatus
 sslNegotiate(aeEventLoop *el, int fd, void *privdata, aeFileProc *post_handshake_handler,
-                int post_handshake_handler_mask, aeFileProc *sourceProcedure, char *sourceProcedureName);
+                int post_handshake_handler_mask, aeFileProc *sourceProcedure, const char *sourceProcedureName);
 
 static int updateEventHandlerForSslHandshake(s2n_blocked_status blocked, aeEventLoop *el, int fd, void *privdata,
                                              aeFileProc *sourceProc);
@@ -169,61 +193,6 @@ static void addRepeatedRead(ssl_connection *conn);
 static void removeRepeatedRead(ssl_connection *conn);
 
 /* =============================================================================
- * SSL Wrapping
- * ==========================================================================*/
-/* We don't allow wrapping until SSL is initialized. */
-static int ALLOW_WRAP = 0;
-
-/* 
- * This class of functions are used by the preprocessor to overwrite
- * system calls when built with SSL. When "read()" is called in the rest
- * of redis, the __redis_wrap_read() will be called instead, which will 
- * determine if the fd should be forwarded to the SSL handlers. This allows 
- * the rest of the redis code base to be more agnostic to the existence of SSL. 
- * The name __redis_wrap is used because of it's similarity to the ld --wrap
- * functionality, but don't want to overlap the naming.
- */
-ssize_t __redis_wrap_read(int fd, void *buffer, size_t nbytes) {
-    if (ALLOW_WRAP && isSSLEnabled() && isSSLFd(fd)) {
-        return sslRead(fd, buffer, nbytes);
-    } else {
-        return (read)(fd, buffer, nbytes);
-    }
-}
-
-ssize_t __redis_wrap_write(int fd, const void *buffer, size_t nbytes) {
-    if (ALLOW_WRAP && isSSLEnabled() && isSSLFd(fd)) {
-        return sslWrite(fd, buffer, nbytes);
-    } else {
-        return (write)(fd, buffer, nbytes);
-    }
-}
-
-int __redis_wrap_close(int fd) {
-    if (ALLOW_WRAP && isSSLEnabled() && isSSLFd(fd)) {
-        return sslClose(fd);
-    } else {
-        return (close)(fd);
-    }
-}
-
-const char *__redis_wrap_strerror(int err) {
-    if (ALLOW_WRAP && isSSLEnabled()) {
-        return sslStrerror(err);
-    } else {
-        return (strerror)(err);
-    }
-}
-
-void __redis_wrap_ping(int fd) {
-    if (ALLOW_WRAP && isSSLEnabled() && isSSLFd(fd)) {
-        sslPing(fd);
-    } else {
-        (write)((fd), "\n", 1);
-    }
-}
-
-/* =============================================================================
  * SSL configuration management
  * ==========================================================================*/
 
@@ -236,19 +205,19 @@ uint8_t s2nVerifyHost(const char *hostName, size_t length, void *data) {
     /* if present, match server_name of the connection using rules
      * outlined in RFC6125 6.4. */
 
-    if (server.ssl_config.expected_hostname == NULL) {
+    if (g_ssl_config.expected_hostname == NULL) {
         return 0;
     }
 
     /* complete match */
-    if (strlen(server.ssl_config.expected_hostname) == length &&
-            strncasecmp(server.ssl_config.expected_hostname, hostName, length) == 0) {
+    if (strlen(g_ssl_config.expected_hostname) == length &&
+            strncasecmp(g_ssl_config.expected_hostname, hostName, length) == 0) {
         return 1;
     }
 
     /* match 1 level of wildcard */
     if (length > 2 && hostName[0] == '*' && hostName[1] == '.') {
-        const char *suffix = strchr(server.ssl_config.expected_hostname, '.');
+        const char *suffix = strchr(g_ssl_config.expected_hostname, '.');
 
         if (suffix == NULL) {
             return 0;
@@ -312,28 +281,24 @@ void initSsl(ssl_t *ssl) {
     }
 
     /* The expected hostname from the certificate to use as part of hostname validation */
-    ssl->expected_hostname = zmalloc(CERT_CNAME_MAX_LENGTH);
+    ssl->expected_hostname = (char*)malloc(CERT_CNAME_MAX_LENGTH);
     if (getCnameFromCertificate(ssl->ssl_certificate, ssl->expected_hostname) == C_ERR) {
         serverLog(LL_WARNING, "Error while discovering expected hostname from certificate file");        
         serverAssert(0);
     }
     
     /* Allocate space for not before and not after dates */
-    ssl->certificate_not_after_date = zmalloc(CERT_DATE_MAX_LENGTH);
-    ssl->certificate_not_before_date = zmalloc(CERT_DATE_MAX_LENGTH);
+    ssl->certificate_not_after_date = (char*)malloc(CERT_DATE_MAX_LENGTH);
+    ssl->certificate_not_before_date = (char*)malloc(CERT_DATE_MAX_LENGTH);
 
     if (updateServerCertificateInformation(ssl->ssl_certificate, 
             ssl->certificate_not_before_date, ssl->certificate_not_after_date,
-            &server.ssl_config.certificate_serial) == C_ERR) {
+            &g_ssl_config.certificate_serial) == C_ERR) {
         serverLog(LL_WARNING, "Error while discovering not_after and not_before from certificate file");        
         serverAssert(0);         
     }
     
-    /*initialize array to store socked fd to SSL connections mapping */
-    ssl->fd_to_sslconn_size = server.maxclients + CONFIG_FDSET_INCR;
-    ssl->fd_to_sslconn = zcalloc(sizeof(ssl_connection *) * ssl->fd_to_sslconn_size);
     ssl->sslconn_with_cached_data = listCreate();
-    ALLOW_WRAP = 1;
 }
 
 static struct s2n_config *
@@ -432,47 +397,12 @@ void cleanupSsl(ssl_t *ssl) {
     }
 
     listRelease(ssl->sslconn_with_cached_data);
-    zfree(ssl->expected_hostname);
-    zfree(ssl->fd_to_sslconn);
-    zfree(ssl->certificate_not_after_date);
-    zfree(ssl->certificate_not_before_date);
+    free(ssl->expected_hostname);
+    free(ssl->certificate_not_after_date);
+    free(ssl->certificate_not_before_date);
 }
 
-/**
- * Returns 1 if fd_to_ssl_conn can be resized from cur_size to new_size
- */
-int isResizeAllowed(int new_size) {
-    int max_fd = -1;
-    for (int i = server.ssl_config.fd_to_sslconn_size - 1; i >= 0; i--) {
-        if (server.ssl_config.fd_to_sslconn[i] != NULL) {
-            max_fd = i;
-            break;
-        }
-    }
-    return max_fd < new_size ? 1 : 0;
-}
-
-/* Resize the maximum size of the fd_to_ssl_conn.
- * If the requested set size is smaller than the current set size, but
- * there is already a file descriptor in use that is >= the requested
- * set size minus one, C_ERR is returned and the operation is not
- * performed at all.
- * 
- * Otherwise C_OK is returned and the operation is successful. */
-int resizeFdToSslConnSize(unsigned int setsize) {
-    
-    if (setsize == server.ssl_config.fd_to_sslconn_size) {
-        return C_OK;
-    } 
-    
-    if (isResizeAllowed(setsize) == 0) {
-        return C_ERR;
-    } 
-
-    zrealloc(server.ssl_config.fd_to_sslconn, sizeof(ssl_connection *) * setsize);
-    return C_OK;
-}
-
+#ifdef UNSUPPORTED
 /**
  * Disconnect any clients that are still using old certificate and mark all
  * of the connections as using the older connection so that the count of 
@@ -485,7 +415,7 @@ static void updateClientsUsingOldCertificate(void) {
     listNode *ln;
     client *client;
 
-    if (server.ssl_config.server_ssl_config_old != NULL) {
+    if (g_ssl_config.server_ssl_config_old != NULL) {
         serverLog(LL_VERBOSE, "Disconnecting clients using very old certificates");
         unsigned int clients_disconnected = 0;
         while ((ln = listNext(&li)) != NULL) {
@@ -534,22 +464,22 @@ int renewCertificate(char *new_certificate, char *new_private_key,
     }
 
     new_config = initSslConfigForServer(new_certificate, new_chain_and_key,
-        server.ssl_config.ssl_dh_params, server.ssl_config.ssl_cipher_prefs);
+        g_ssl_config.ssl_dh_params, g_ssl_config.ssl_cipher_prefs);
     if (new_config == NULL) {
         serverLog(LL_DEBUG, "Error creating SSL configuration using new certificate");
         goto renew_error;
     }
 
-    char *newNotBeforeDate = zmalloc(CERT_DATE_MAX_LENGTH);    
-    char *newNotAfterDate = zmalloc(CERT_DATE_MAX_LENGTH);
+    char *newNotBeforeDate = malloc(CERT_DATE_MAX_LENGTH);    
+    char *newNotAfterDate = malloc(CERT_DATE_MAX_LENGTH);
     long newSerial = 0;
 
     /* Update the not before and not after date provided in info */
     if (updateServerCertificateInformation(new_certificate, newNotBeforeDate, 
             newNotAfterDate, &newSerial) != C_OK) {
         serverLog(LL_DEBUG, "Failed to read not_before and not_after date from new certificate");
-        zfree(newNotBeforeDate);
-        zfree(newNotAfterDate);
+        free(newNotBeforeDate);
+        free(newNotAfterDate);
         goto renew_error;
     }
 
@@ -559,44 +489,44 @@ int renewCertificate(char *new_certificate, char *new_private_key,
      *clients using oldest certificate to stay within 2 certificate limit */
     updateClientsUsingOldCertificate();
 
-    if (server.ssl_config.server_ssl_config_old) {
+    if (g_ssl_config.server_ssl_config_old) {
         /* Now that no client are using the old config, free it */
-        if (s2n_config_free(server.ssl_config.server_ssl_config_old) < 0)
+        if (s2n_config_free(g_ssl_config.server_ssl_config_old) < 0)
             serverLog(LL_WARNING, "Error freeing the old server SSL config: %s", s2n_strerror(s2n_errno, "EN"));
-        server.ssl_config.server_ssl_config_old = server.ssl_config.server_ssl_config;
+        g_ssl_config.server_ssl_config_old = g_ssl_config.server_ssl_config;
 
-        if (s2n_cert_chain_and_key_free(server.ssl_config.cert_chain_and_key_old) < 0)
+        if (s2n_cert_chain_and_key_free(g_ssl_config.cert_chain_and_key_old) < 0)
             serverLog(LL_WARNING, "Error freeing the old SSL cert chain and key: %s", s2n_strerror(s2n_errno, "EN"));
-        server.ssl_config.cert_chain_and_key_old = server.ssl_config.cert_chain_and_key;
+        g_ssl_config.cert_chain_and_key_old = g_ssl_config.cert_chain_and_key;
     }
 
     /* start using new configuration. Any new connections
      * will start using new certificate from this point onwards */
-    server.ssl_config.server_ssl_config = new_config;
-    server.ssl_config.cert_chain_and_key = new_chain_and_key;
+    g_ssl_config.server_ssl_config = new_config;
+    g_ssl_config.cert_chain_and_key = new_chain_and_key;
 
     /*free the memory used by old stuff */
-    zfree((void *) server.ssl_config.ssl_certificate);
-    zfree((void *) server.ssl_config.ssl_certificate_file);
-    zfree((void *) server.ssl_config.ssl_certificate_private_key);
-    zfree((void *) server.ssl_config.ssl_certificate_private_key_file);
-    zfree((void *) server.ssl_config.certificate_not_before_date);    
-    zfree((void *) server.ssl_config.certificate_not_after_date);
+    free((void *) g_ssl_config.ssl_certificate);
+    free((void *) g_ssl_config.ssl_certificate_file);
+    free((void *) g_ssl_config.ssl_certificate_private_key);
+    free((void *) g_ssl_config.ssl_certificate_private_key_file);
+    free((void *) g_ssl_config.certificate_not_before_date);    
+    free((void *) g_ssl_config.certificate_not_after_date);
 
     /*save the references to the new stuff */
-    server.ssl_config.ssl_certificate = new_certificate;
-    server.ssl_config.ssl_certificate_file = new_certificate_filename;
+    g_ssl_config.ssl_certificate = new_certificate;
+    g_ssl_config.ssl_certificate_file = new_certificate_filename;
 
-    server.ssl_config.ssl_certificate_private_key = new_private_key;
-    server.ssl_config.ssl_certificate_private_key_file = new_private_key_filename;
+    g_ssl_config.ssl_certificate_private_key = new_private_key;
+    g_ssl_config.ssl_certificate_private_key_file = new_private_key_filename;
 
-    server.ssl_config.certificate_not_before_date = newNotBeforeDate;
-    server.ssl_config.certificate_not_after_date = newNotAfterDate;
-    server.ssl_config.certificate_serial = newSerial;
+    g_ssl_config.certificate_not_before_date = newNotBeforeDate;
+    g_ssl_config.certificate_not_after_date = newNotAfterDate;
+    g_ssl_config.certificate_serial = newSerial;
     
     /* Update the connection count for redis info */
-    server.ssl_config.connections_to_previous_certificate = server.ssl_config.connections_to_current_certificate;
-    server.ssl_config.connections_to_current_certificate = 0;
+    g_ssl_config.connections_to_previous_certificate = g_ssl_config.connections_to_current_certificate;
+    g_ssl_config.connections_to_current_certificate = 0;
 
     serverLog(LL_NOTICE, "Successfully renewed SSL certificate");
 
@@ -608,6 +538,7 @@ renew_error:
         serverLog(LL_WARNING, "Error freeing the new server SSL config on renew: %s", s2n_strerror(s2n_errno, "EN"));
     return C_ERR;
 }
+#endif
 
 
 /**
@@ -721,7 +652,7 @@ static ssize_t sslRecv(int fd, void *buffer, size_t nbytes, s2n_blocked_status *
     s2n_errno = S2N_ERR_T_OK;
     errno = 0;
 
-    ssl_connection *ssl_conn = server.ssl_config.fd_to_sslconn[fd];
+    ssl_connection *ssl_conn = fd_to_sslconn(fd);
     ssize_t bytesread = s2n_recv(ssl_conn->s2nconn, buffer, nbytes, blocked);
 
     if (bytesread < 0 && s2n_error_get_type(s2n_errno) == S2N_ERR_T_BLOCKED) {
@@ -740,10 +671,10 @@ static ssize_t sslRecv(int fd, void *buffer, size_t nbytes, s2n_blocked_status *
  * SSL compatible read IO method. This method sets errno
  * so that is compatible with a normal read syscall.
  */
-static ssize_t sslRead(int fd, void *buffer, size_t nbytes) {
+ssize_t sslRead(int fd, void *buffer, size_t nbytes) {
     s2n_blocked_status blocked;
     ssize_t bytesread = sslRecv(fd, buffer, nbytes, &blocked);
-    ssl_connection *ssl_conn = server.ssl_config.fd_to_sslconn[fd];
+    ssl_connection *ssl_conn = fd_to_sslconn(fd);
     if (bytesread > 0 && blocked == S2N_BLOCKED_ON_READ) {
         /* Data was returned, but we didn't consume an entire frame, 
          * so signal that we need to repeat the event handler. */
@@ -769,7 +700,7 @@ static ssize_t sslRead(int fd, void *buffer, size_t nbytes) {
  * While negotiation is in progress sending data here will cause the 
  * negotiation to break, so that needs to be handled by the caller.
  */
-static void sslPing(int fd) {
+void sslPing(int fd) {
     ssize_t byteswritten = sslWrite(fd, "\n", 1);
     if (byteswritten < 0 && errno == EAGAIN) {
         /* A newline ping request is in progress.  We need to make sure 
@@ -784,7 +715,7 @@ static void sslPing(int fd) {
  * SSL compatible write IO method. This method sets errno
  * so that is compatible with a normal write syscall.
  */
-static ssize_t sslWrite(int fd, const void *buffer, size_t nbytes) {
+ssize_t sslWrite(int fd, const void *buffer, size_t nbytes) {
     s2n_errno = S2N_ERR_T_OK;
     errno = 0;
 
@@ -820,9 +751,12 @@ static ssize_t sslWrite(int fd, const void *buffer, size_t nbytes) {
 /**
  * SSL compatible close IO method.
  */
-static int sslClose(int fd) {
+int sslClose(int fd) {
+    ++fInSsl;
     cleanupSslConnectionForFd(fd);
-    return close(fd);
+    int rval = close(fd);
+    --fInSsl;
+    return rval;
 }
 
 /**
@@ -830,7 +764,7 @@ static int sslClose(int fd) {
  * prints out its corresponding error, otherwise it prints the error
  * associated with the errno that is passed in. 
  */
-static const char *sslStrerror(int err) {
+const char *sslStrerror(int err) {
     if (s2n_error_get_type(s2n_errno) == S2N_ERR_T_IO) {
         /* S2N_ERR_T_IO => underlying I/O operation failed, check system errno
          * therefore in this case, returning System IO error string */
@@ -847,7 +781,7 @@ static const char *sslStrerror(int err) {
 /* Convenience function to fetch an sslConnection from a fd and make sure it exists */
 ssl_connection *getSslConnectionForFd(int fd) {
     serverAssert(isSSLFd(fd));
-    return server.ssl_config.fd_to_sslconn[fd];
+    return fd_to_sslconn(fd);
 }
 
 /**
@@ -866,15 +800,15 @@ initSslConnection(sslMode mode, int fd, int ssl_performance_mode, char *masterho
 
     if (mode == SSL_SERVER) {
         connection_mode = S2N_SERVER;
-        config = server.ssl_config.server_ssl_config;
+        config = g_ssl_config.server_ssl_config;
     } else if (mode == SSL_CLIENT) {
         connection_mode = S2N_CLIENT;
-        config = server.ssl_config.client_ssl_config;
+        config = g_ssl_config.client_ssl_config;
     } else {
         return NULL;
     }
 
-    ssl_connection *sslconn = zmalloc(sizeof(ssl_connection));
+    ssl_connection *sslconn = (ssl_connection*)malloc(sizeof(ssl_connection));
     if (!sslconn) {
         serverLog(LL_WARNING, "Error creating new ssl connection.");
         return NULL;
@@ -937,8 +871,7 @@ initSslConnection(sslMode mode, int fd, int ssl_performance_mode, char *masterho
     }
 
     /* Create an entry for Socket FD to SSL connection mapping */
-    serverAssert((size_t) fd < server.ssl_config.fd_to_sslconn_size);
-    server.ssl_config.fd_to_sslconn[fd] = sslconn;
+    set_sslconn(fd, sslconn);
     serverLog(LL_DEBUG, "SSL Connection setup successfully for fd %d", fd);
     return sslconn;
                         
@@ -962,7 +895,7 @@ int setupSslOnClient(client *c, int fd, int ssl_performance_mode) {
     }
 
     /* Increment the number of connections associated with the latest certificate */
-    server.ssl_config.connections_to_current_certificate++;
+    g_ssl_config.connections_to_current_certificate++;
     ssl_conn->connection_flags |= CLIENT_CONNECTION_FLAG;
 
     if (aeCreateFileEvent(server.el, fd, AE_READABLE | AE_WRITABLE,
@@ -1016,9 +949,9 @@ void cleanupSslConnection(struct ssl_connection *conn, int fd, int shutdown) {
     serverLog(LL_DEBUG, "Cleaning up SSL conn for socket fd: %d", fd);
     if (conn->connection_flags & CLIENT_CONNECTION_FLAG) {
         if (conn->connection_flags & OLD_CERTIFICATE_FLAG) {
-            server.ssl_config.connections_to_previous_certificate--;
+            g_ssl_config.connections_to_previous_certificate--;
         } else {
-            server.ssl_config.connections_to_current_certificate--;
+            g_ssl_config.connections_to_current_certificate--;
         }
     }
     
@@ -1028,8 +961,7 @@ void cleanupSslConnection(struct ssl_connection *conn, int fd, int shutdown) {
     }
     freeSslConnection(conn);
     serverLog(LL_DEBUG, "Deleting fd: %d from fd_to_sslconn map", fd);
-    serverAssert((unsigned int)fd < server.ssl_config.fd_to_sslconn_size);
-    server.ssl_config.fd_to_sslconn[fd] = NULL;
+    set_sslconn(fd, NULL);
 }
 
 /**
@@ -1061,7 +993,7 @@ int freeSslConnection(ssl_connection *conn) {
         if (conn->cached_data_node != NULL) {
             removeRepeatedRead(conn);
         }
-        zfree(conn);
+        free(conn);
     }
     return ret;
 }
@@ -1077,13 +1009,15 @@ int freeSslConnection(ssl_connection *conn) {
 void sslNegotiateWithClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(mask);
     client *c = (client *) privdata;
-
-    if (sslNegotiate(el, fd, privdata, readQueryFromClient, AE_READABLE, sslNegotiateWithClient,
+    ++fInSsl;
+    if (sslNegotiate(el, fd, privdata, readQueryFromClient, AE_READABLE|AE_READ_THREADSAFE, sslNegotiateWithClient,
                         "sslNegotiateWithClient") == NEGOTIATE_FAILED) {
         freeClient(c);
     }
+    --fInSsl;
 }
 
+#ifdef UNSUPPORTED
 /**
  * SSL negotiate (acting as server) with another cluster node over cluster bus
  */
@@ -1123,7 +1057,9 @@ void sslNegotiateWithClusterNodeAsClient(aeEventLoop *el, int fd, void *privdata
     }
     return;
 }
+#endif
 
+#ifdef UNSUPPORTED
 /**
  * Perform SSL negotiation with replication master
  */
@@ -1165,6 +1101,7 @@ error:
     server.repl_state = REPL_STATE_CONNECT;
     return;
 }
+#endif
 
 /**
  * Helper method for SSL negotiation that doesn't involve the event loop, and should block until it
@@ -1206,6 +1143,7 @@ int syncSslNegotiateForFd(int fd, long timeout) {
     return C_OK;
 }
 
+#ifdef UNSUPPORTED
 /**
  * If SSL is enabled, master and slave need to do SSL handshake
  * again. The reason being that forked bgsave'ed
@@ -1219,7 +1157,7 @@ void startSslNegotiateWithSlaveAfterRdbTransfer(struct client *slave) {
               slave->id, slave->fd);
     cleanupSslConnectionForFdWithoutShutdown(slave->fd);
     if (initSslConnection(SSL_SERVER, slave->fd,
-            server.ssl_config.ssl_performance_mode, NULL) == NULL) {
+            g_ssl_config.ssl_performance_mode, NULL) == NULL) {
         goto error;          
     }
     aeDeleteFileEvent(server.el, slave->fd, AE_READABLE | AE_WRITABLE);
@@ -1374,7 +1312,7 @@ void sslNegotiateWithSlaveAfterSocketRdbTransfer(aeEventLoop *el, int fd, void *
             slave->repl_ack_time = server.unixtime;
             break;
         case NEGOTIATE_DONE:
-            if (aeCreateFileEvent(server.el, fd, AE_READABLE, readQueryFromClient, slave) == AE_ERR) {
+            if (aeCreateFileEvent(server.el, fd, AE_READABLE|AE_READ_THREADSAFE, readQueryFromClient, slave) == AE_ERR) {
                     freeClient(slave);
                 return;          
             }
@@ -1413,7 +1351,7 @@ void sslNegotiateWithMasterAfterSocketRdbLoad(aeEventLoop *el, int fd, void *pri
         /* We wrote at least one byte, which is all we were attempting to write so continue */
         cleanupSslConnectionForFdWithoutShutdown(fd);
         
-        if (initSslConnection(SSL_CLIENT, fd, server.ssl_config.ssl_performance_mode, server.masterhost) == NULL) {
+        if (initSslConnection(SSL_CLIENT, fd, g_ssl_config.ssl_performance_mode, server.masterhost) == NULL) {
             cancelReplicationHandshake();
             return;
         }
@@ -1446,6 +1384,7 @@ void sslNegotiateWithMasterAfterSocketRdbLoad(aeEventLoop *el, int fd, void *pri
     }
     return;
 }
+#endif
 
 
 /**
@@ -1486,7 +1425,7 @@ int updateEventHandlerForSslHandshake(s2n_blocked_status blocked, aeEventLoop *e
  */
 SslNegotiationStatus
 sslNegotiate(aeEventLoop *el, int fd, void *privdata, aeFileProc *post_handshake_handler,
-                int post_handshake_handler_mask, aeFileProc *sourceProcedure, char *sourceProcedureName) {
+                int post_handshake_handler_mask, aeFileProc *sourceProcedure, const char *sourceProcedureName) {
     ssl_connection *ssl_conn = getSslConnectionForFd(fd);
         
     serverLog(LL_DEBUG, "resuming SSL negotiation from %s", sourceProcedureName);
@@ -1546,17 +1485,17 @@ static int processRepeatedReads(struct aeEventLoop *eventLoop, long long id, voi
     UNUSED(id);
     UNUSED(clientData);
 
-    if (!isSSLEnabled()|| listLength(server.ssl_config.sslconn_with_cached_data) == 0) {
-        server.ssl_config.repeated_reads_task_id = AE_ERR;
+    if (!isSSLEnabled()|| listLength(g_ssl_config.sslconn_with_cached_data) == 0) {
+        g_ssl_config.repeated_reads_task_id = AE_ERR;
         return AE_NOMORE;
     }
 
     /* Create a copy of our list so it can be modified arbitrarily during read handler execution */
-    list *copy = listDup(server.ssl_config.sslconn_with_cached_data);
+    list *copy = listDup(g_ssl_config.sslconn_with_cached_data);
 
     /* Record maximum list length */
-    if (listLength(copy) > server.ssl_config.max_repeated_read_list_length) {
-        server.ssl_config.max_repeated_read_list_length = listLength(copy);
+    if (listLength(copy) > g_ssl_config.max_repeated_read_list_length) {
+        g_ssl_config.max_repeated_read_list_length = listLength(copy);
     }
 
     listNode *ln;
@@ -1564,21 +1503,21 @@ static int processRepeatedReads(struct aeEventLoop *eventLoop, long long id, voi
 
     listRewind(copy, &li);
     while((ln = listNext(&li))) {
-        ssl_connection *conn = ln->value;
+        ssl_connection *conn = (ssl_connection*)ln->value;
         /* If the descriptor is not processing read events, skip it this time and check next time.  It will remain on our list until
          * drained. */
         if (aeGetFileEvents(eventLoop, conn->fd) & AE_READABLE) {
             /* The read handler is expected to remove itself from the repeat read list when there is no longer cached data */
             aeGetFileProc(eventLoop, conn->fd, AE_READABLE)(eventLoop, conn->fd, aeGetClientData(eventLoop, conn->fd), AE_READABLE);
-            server.ssl_config.total_repeated_reads++;
+            g_ssl_config.total_repeated_reads++;
         }
     }
 
     listRelease(copy);
 
-    if (listLength(server.ssl_config.sslconn_with_cached_data) == 0) {
+    if (listLength(g_ssl_config.sslconn_with_cached_data) == 0) {
         /* No more cached data left */
-        server.ssl_config.repeated_reads_task_id = AE_ERR;
+        g_ssl_config.repeated_reads_task_id = AE_ERR;
         return AE_NOMORE;
     } else {
         return 0; /* Run as fast as possible without sleeping next time around */
@@ -1594,13 +1533,13 @@ static void addRepeatedRead(ssl_connection *conn) {
         return;
     }
 
-    listAddNodeTail(server.ssl_config.sslconn_with_cached_data, conn);
-    conn->cached_data_node = listLast(server.ssl_config.sslconn_with_cached_data);
+    listAddNodeTail(g_ssl_config.sslconn_with_cached_data, conn);
+    conn->cached_data_node = listLast(g_ssl_config.sslconn_with_cached_data);
 
-    if (server.ssl_config.repeated_reads_task_id == AE_ERR) {
+    if (g_ssl_config.repeated_reads_task_id == AE_ERR) {
         /* Schedule the task to process the list */
-        server.ssl_config.repeated_reads_task_id = aeCreateTimeEvent(server.el, 0, processRepeatedReads, NULL, NULL);
-        if (server.ssl_config.repeated_reads_task_id == AE_ERR) {
+        g_ssl_config.repeated_reads_task_id = aeCreateTimeEvent(server.el, 0, processRepeatedReads, NULL, NULL);
+        if (g_ssl_config.repeated_reads_task_id == AE_ERR) {
             serverLog(LL_WARNING, "Can't create the processRepeatedReads time event.");
         }
     }
@@ -1613,7 +1552,7 @@ static void removeRepeatedRead(ssl_connection *conn) {
         return;
     }
 
-    listDelNode(server.ssl_config.sslconn_with_cached_data, conn->cached_data_node);
+    listDelNode(g_ssl_config.sslconn_with_cached_data, conn->cached_data_node);
     conn->cached_data_node = NULL;
 
     /* processRepeatedReads task is responsible for self-terminating when no more reads */

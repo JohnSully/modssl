@@ -33,6 +33,8 @@
 #ifndef SSL_H
 #define SSL_H
 
+#undef _DEFAULT_SOURCE
+#include <server.h>
 #include <stddef.h>
 #include <string.h>
 #include <stdint.h>
@@ -46,7 +48,19 @@
 #define SSL_ENABLE_DEFAULT 0
 #define SSL_CIPHER_PREFS_DEFAULT "default"
 
-#include "adlist.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <sys/socket.h>
+
+#ifdef KEYDB
+#define server (*serverTL)
+#endif
+
+#ifndef KEYDB
+#define AE_READ_THREADSAFE 0
+#endif
 
 struct client;
 struct s2n_config;
@@ -55,8 +69,7 @@ struct client_cert_verify_context;
 struct aeEventLoop;
 typedef struct aeEventLoop aeEventLoop;
 
-#define AE_OK 0
-#define AE_ERR -1
+extern __thread int fInSsl;
 
 typedef enum {
     NEGOTIATE_NOT_STARTED = 0, NEGOTIATE_RETRY, NEGOTIATE_DONE, NEGOTIATE_FAILED
@@ -122,12 +135,9 @@ typedef struct ssl_t {
     char *ssl_certificate_private_key_file; /* File containing private key corresponding to SSL certificate*/
     char *ssl_dh_params; /* DH parameters for SSL*/
     char *ssl_dh_params_file; /* File containing DH parameters for SSL*/
-    char *ssl_cipher_prefs; /* Cipher preferences for SSL */
+    const char *ssl_cipher_prefs; /* Cipher preferences for SSL */
     int ssl_performance_mode; /* SSL performance mode - low latency or high throughput */
     char *root_ca_certs_path; /* Path to root CA certificates */
-
-    ssl_connection **fd_to_sslconn; /* socket fd to SSL connection mapping */
-    size_t fd_to_sslconn_size; /* current size of fd_to_sslconn mapping */
 
     list *sslconn_with_cached_data; /* A list of SSL connections which contain cached data, which will be drained by repeated read task. */
     long long repeated_reads_task_id; /* The ae task ID of the timer event to process repeated reads, or -1 if not set. */
@@ -142,21 +152,24 @@ typedef struct ssl_t {
     int connections_to_current_certificate; /* The number of connections that connected to the new certificate */
 } ssl_t;
 
+ssl_connection *fd_to_sslconn(int fd);
+void set_sslconn(int fd, ssl_connection *);
+
 /* SSL helper functions that can be called without SSL compiled */
 int getSslPerformanceModeByName(char *name);
-char *getSslPerformanceModeStr(int mode);
+const char *getSslPerformanceModeStr(int mode);
 void initSslConfigDefaults(ssl_t *ssl);
 void noopHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 
 #ifdef BUILD_SSL
-typedef struct
+typedef struct client_cert_verify_context
 {
     X509_STORE * trust_store;
     char *expected_hostname;
 } client_cert_verify_context;
 
 /* Macros to help simplify SSL code path */
-#define isSSLEnabled() server.ssl_config.enable_ssl
+#define isSSLEnabled() 1
 #define isSSLCompiled() 1
 
 /* SSL configuration functions */
@@ -200,9 +213,7 @@ int __redis_wrap_close(int fd);
 void __redis_wrap_ping(int fd);
 const char *__redis_wrap_strerror(int err);
 
-#define isSSLFd(fd) (((size_t)(fd) < server.ssl_config.fd_to_sslconn_size) && \
-    (server.ssl_config.fd_to_sslconn[(fd)] != NULL))
-
+#define isSSLFd(fd) (fd_to_sslconn(fd) != NULL)
 #else
 
 /* Macros to help simplify SSL code path */
@@ -236,6 +247,10 @@ const char *__redis_wrap_strerror(int err);
 #define startWaitForSlaveToLoadRdbAfterRdbTransfer(slave) noop()
 #define syncSslNegotiateForFd(fd, timeout) 0
 #define deleteReadEventHandlerForSlavesWaitingBgsave() noop()
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif /* SSL_H */

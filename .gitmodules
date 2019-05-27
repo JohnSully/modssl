@@ -1,3 +1,6 @@
 [submodule "submodules/s2n"]
 	path = submodules/s2n
 	url = https://github.com/awslabs/s2n.git
+[submodule "submodules/subhook"]
+	path = submodules/subhook
+	url = https://github.com/Zeex/subhook.git

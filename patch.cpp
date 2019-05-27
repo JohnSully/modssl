@@ -1,26 +1,19 @@
-#include "ssl.h"
 #include <unordered_map>
+#include <subhook.h>
 
-#define C_OK                    0
-#define C_ERR                   -1
+struct ssl_connection;
 
-client* (*createClientHost)(int) = nullptr;
+std::unordered_map<int, ssl_connection*> g_mapsslconn;
 
-extern void freeClient(client *);
-
-
-
-extern "C" client *createClientWrapper(int fd)
+extern "C" ssl_connection *fd_to_sslconn(int fd)
 {
-	client *c = createClientHost(fd);
-	if (c != nullptr)
-	{
-		int res = setupSslOnClient(c, fd, SSL_PERFORMANCE_MODE_DEFAULT);
-		if (res == C_ERR)
-		{
-			freeClient(c);
-			return nullptr;
-		}
-	}
-	return c;
+	auto itr = g_mapsslconn.find(fd);
+	if (itr == g_mapsslconn.end())
+		return NULL;
+	return itr->second;
+}
+
+extern "C" void set_sslconn(int fd, ssl_connection *conn)
+{
+	g_mapsslconn[fd] = conn;
 }
