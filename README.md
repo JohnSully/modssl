@@ -1,4 +1,4 @@
-# modssl for [Redis](https://github.com/antirez/redis) and [KeyDB](https://github.com/JohnSully/KeyDB)
+# modssl An SSL Module for [Redis](https://github.com/antirez/redis) and [KeyDB](https://github.com/JohnSully/KeyDB)
 modssl is a demonstration of SSL support wrapped in a module.  Because Redis' module API is not quite powerful enough to support this it relies upon hot patching to replicate the missing APIs.
 The goal of this project is to promote encryption and encourage expansion to the Redis module API.
 
