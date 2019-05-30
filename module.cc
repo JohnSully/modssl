@@ -1,4 +1,5 @@
 #include "ssl.h"
+#define REDISMODULE_EXPERIMENTAL_API
 #include "redismodule.h"
 #include "release.h"
 #include "hook.h"
@@ -12,6 +13,71 @@ extern ssl_t g_ssl_config;
 #ifdef __cplusplus
 extern "C" 
 #endif
+
+ssize_t sslRead(int fd, void *buffer, size_t nbytes);
+ssize_t sslWrite(int fd, const void *buffer, size_t nbytes);
+int sslClose(int fd);
+void sslPing(int fd);
+const char *sslStrerror(int err);
+
+int readHandler(int fd, void *buf, size_t cb, ssize_t *pccbRead)
+{
+	if (isSSLFd(fd))
+	{
+		*pccbRead = sslRead(fd, buf, cb);
+		return 1;
+	}
+	return 0;	// unhandled
+}
+
+int writeHandler(int fd, const void *buf, size_t cb, ssize_t *pccbWrite)
+{
+	if (isSSLFd(fd))
+	{
+		*pccbWrite = sslWrite(fd, buf, cb);
+		return 1;
+	}
+	return 0;
+}
+
+
+int OnFDEvent(int fd, enum MODULE_FD_EVENT evt, void (*fnAfter)(int, uint64_t), uint64_t arg)
+{
+	switch (evt)
+	{
+		default:
+			return 0;	// event not handled
+
+		case MODULE_FD_CLOSE:
+		{
+			if (isSSLFd(fd))
+			{
+				sslClose(fd);
+				return 1;
+			}
+			return 0;
+		}
+
+		case MODULE_FD_ACCEPT:
+		{
+			SslEventAfterHandler *after = malloc(sizeof(after));
+			after->fn = fnAfter;
+			after->arg = arg;
+			if (setupSslOnFd(fd, SSL_PERFORMANCE_MODE_DEFAULT, after) == C_ERR)
+			{
+				close(fd);
+			}
+			else
+			{
+				RedisModule_RegisterFdRdFilter(fd, readHandler);
+				RedisModule_RegisterFdWrFilter(fd, writeHandler);
+			}
+			return 1;
+		}
+	}
+}
+
+#if 0
 client *createClientWrapper(int fd)
 {
 	client *c = ((t_createClient)subhook_get_trampoline(g_hookCreateClient))(fd);
@@ -37,69 +103,16 @@ client *createClientWrapper(int fd)
 	}
 	return c;
 }
-
-ssize_t sslRead(int fd, void *buffer, size_t nbytes);
-ssize_t sslWrite(int fd, const void *buffer, size_t nbytes);
-int sslClose(int fd);
-void sslPing(int fd);
-const char *sslStrerror(int err);
+#endif
 
 #include <sys/syscall.h>
 #include <asm/unistd.h>
-__thread int fInSsl = 0;
-ssize_t __redis_wrap_read(int fd, void *buffer, size_t nbytes) {
-	static __thread int fInRead = 0;
-	ssize_t ret;
-    if (!fInRead && !fInSsl && isSSLFd(fd)) {
-		fInRead = 1;
-        ret = sslRead(fd, buffer, nbytes);
-		fInRead = 0;
-    } else {
-        ret = syscall(SYS_read, fd, buffer, nbytes);
-    }
-	return ret;
-}
-
-ssize_t __redis_wrap_write(int fd, const void *buffer, size_t nbytes) {
-	static __thread int fInWrite = 0;
-	ssize_t ret;
-    if (!fInWrite && !fInSsl && isSSLFd(fd)) {
-		fInWrite = 1;
-        ret = sslWrite(fd, buffer, nbytes);
-		fInWrite = 0;
-    } else {
-        ret = syscall(SYS_write, fd, buffer, nbytes);
-    }
-	return ret;
-}
-
-int __redis_wrap_close(int fd) {
-	static __thread int fInClose = 0;
-	int ret;
-    if (!fInClose && !fInSsl && isSSLFd(fd)) {
-		fInClose = 1;
-        ret = sslClose(fd);
-		fInClose = 0;
-    } else {
-        ret = syscall(SYS_close, fd);
-    }
-	return ret;
-}
-
 const char *__redis_wrap_strerror(int err) {
     if (isSSLEnabled()) {
         return sslStrerror(err);
     } else {
         return 
 			((const char*(*)(int))subhook_get_trampoline(g_hookstrerr))(err);
-    }
-}
-
-void __redis_wrap_ping(int fd) {
-    if (isSSLFd(fd)) {
-        sslPing(fd);
-    } else {
-        write((fd), "\n", 1);
     }
 }
 
@@ -112,10 +125,7 @@ int FInitializeDetours()
 		if (subhook_install(hook) < 0) goto LFail; \
 	} while(0)
 
-	SETHOOK(g_hookCreateClient, createClient, createClientWrapper);
-	SETHOOK(g_hookRead, read, __redis_wrap_read);
-	SETHOOK(g_hookWrite, write, __redis_wrap_write);
-	SETHOOK(g_hookClose, close, __redis_wrap_close);
+	RedisModule_RegisterFdEventFilter(OnFDEvent);
 	SETHOOK(g_hookstrerr, strerror, __redis_wrap_strerror);
 
 	return 1;

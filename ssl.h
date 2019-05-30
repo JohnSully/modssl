@@ -79,6 +79,11 @@ typedef enum{
     SSL_SERVER = 0, SSL_CLIENT
 } sslMode;
 
+typedef struct {
+    void (*fn)(int, uint64_t);
+    uint64_t arg;
+} SslEventAfterHandler;
+
 #define SSL_PERFORMANCE_MODE_LOW_LATENCY 0
 #define SSL_PERFORMANCE_MODE_HIGH_THROUGHPUT 1
 #define SSL_PERFORMANCE_MODE_DEFAULT SSL_PERFORMANCE_MODE_LOW_LATENCY
@@ -109,10 +114,6 @@ typedef struct ssl_connection {
     /* LOAD_NOTIFICATION_SENT_FLAG: Has the load notification character been sent to the master */
     /* CLIENT_CONNECTION_FLAG: Is this connection associated with a redis client */
     /* OLD_CERTIFICATE_FLAG: Is this connection associated with an older certificate */
-
-    /* Does the S2N connection contain cached data?  Set to a list node (present in
-     * sslconn_with_cached_data list) if true, NULL otherwise. */
-    listNode *cached_data_node;
 
 } ssl_connection;
 
@@ -183,7 +184,7 @@ int renewCertificate(char *new_certificate, char *new_private_key, char *new_cer
 /* SSL connection functions */
 ssl_connection *
 initSslConnection(sslMode mode, int fd, int ssl_performance_mode, char *masterhost);
-int setupSslOnClient(struct client *c, int fd, int ssl_performance_mode);
+int setupSslOnFd(int fd, int ssl_performance_mode, SslEventAfterHandler *after);
 void cleanupSslConnectionForFd(int fd);
 void cleanupSslConnectionForFdWithoutShutdown(int fd);
 

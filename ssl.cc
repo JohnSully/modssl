@@ -38,30 +38,6 @@
 
 ssl_t g_ssl_config;
 
-/* Return the file proc for a file descriptor and given event
- * (AE_READABLE or AE_WRITABLE) or null if one does not exist. */
-aeFileProc* aeGetFileProc(aeEventLoop *eventLoop, int fd, int event) {
-    if (fd >= eventLoop->setsize) return NULL;
-    aeFileEvent *fe = &eventLoop->events[fd];
-
-    if (event == AE_READABLE) {
-        return fe->rfileProc;
-    } else if (event == AE_WRITABLE) {
-        return fe->wfileProc;
-    }
-
-    return NULL;
-}
-
-/* Return the client data associated with a file descriptor,
- * or null if it does not exist. */
-void* aeGetClientData(aeEventLoop *eventLoop, int fd) {
-    if (fd >= eventLoop->setsize) return NULL;
-    aeFileEvent *fe = &eventLoop->events[fd];
-
-    return fe->clientData;
-}
-
 /* =============================================================================
  * SSL independent helper functions
  * ==========================================================================*/
@@ -186,11 +162,6 @@ static void sslNegotiateWithSlaveAfterSocketRdbTransfer(aeEventLoop *el, int fd,
 static void sslNegotiateWithMasterAfterSocketRdbLoad(aeEventLoop *el, int fd, void *privdata, int mask);
 static SslNegotiationStatus sslNegotiateWithoutPostHandshakeHandler(aeEventLoop *el, int fd, void *privdata, aeFileProc *sourceProcedure,
     char *sourceProcedureName);
-
-/* Functions for processing repeated reads */                     
-static int processRepeatedReads(struct aeEventLoop *eventLoop, long long id, void *clientData);
-static void addRepeatedRead(ssl_connection *conn);
-static void removeRepeatedRead(ssl_connection *conn);
 
 /* =============================================================================
  * SSL configuration management
@@ -675,15 +646,6 @@ ssize_t sslRead(int fd, void *buffer, size_t nbytes) {
     s2n_blocked_status blocked;
     ssize_t bytesread = sslRecv(fd, buffer, nbytes, &blocked);
     ssl_connection *ssl_conn = fd_to_sslconn(fd);
-    if (bytesread > 0 && blocked == S2N_BLOCKED_ON_READ) {
-        /* Data was returned, but we didn't consume an entire frame, 
-         * so signal that we need to repeat the event handler. */
-        addRepeatedRead(ssl_conn);
-    } else {
-        /* Either the entire frame was consumed, or nothing was 
-         * returned because we were blocked on a socket read. */
-        removeRepeatedRead(ssl_conn);
-    }
 
     return bytesread;
 }
@@ -815,7 +777,6 @@ initSslConnection(sslMode mode, int fd, int ssl_performance_mode, char *masterho
     }
     sslconn->connection_flags = 0;
     sslconn->fd = fd;
-    sslconn->cached_data_node = NULL;
 
     /* create a new connection in Server or Client mode */
     sslconn->s2nconn = s2n_connection_new(connection_mode);
@@ -884,13 +845,14 @@ error:
  * Performs SSL related setup for a client. It includes creating and initializing an SSL connection,
  * and registering an event handler for SSL negotiation
  */
-int setupSslOnClient(client *c, int fd, int ssl_performance_mode) {
+int setupSslOnFd(int fd, int ssl_performance_mode, SslEventAfterHandler *after) {
 
     struct ssl_connection *ssl_conn = initSslConnection(SSL_SERVER, fd, ssl_performance_mode, NULL);
     if (!ssl_conn) {
         serverLog(LL_WARNING, "Error getting new s2n connection for client with fd: %d, Error: '%s'", fd,
 
                   s2n_strerror(s2n_errno, "EN"));
+        free(after);
         return C_ERR;
     }
 
@@ -899,8 +861,9 @@ int setupSslOnClient(client *c, int fd, int ssl_performance_mode) {
     ssl_conn->connection_flags |= CLIENT_CONNECTION_FLAG;
 
     if (aeCreateFileEvent(server.el, fd, AE_READABLE | AE_WRITABLE,
-                          sslNegotiateWithClient, c) == AE_ERR) {
+                          sslNegotiateWithClient, after) == AE_ERR) {
         cleanupSslConnectionForFd(fd);
+        free(after);
         return C_ERR;
     }
     return C_OK;
@@ -990,9 +953,7 @@ int freeSslConnection(ssl_connection *conn) {
                 ret = C_ERR;
             }
         }
-        if (conn->cached_data_node != NULL) {
-            removeRepeatedRead(conn);
-        }
+
         free(conn);
     }
     return ret;
@@ -1008,13 +969,19 @@ int freeSslConnection(ssl_connection *conn) {
  */
 void sslNegotiateWithClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(mask);
-    client *c = (client *) privdata;
+    SslEventAfterHandler *after = (SslEventAfterHandler*)privdata;
     ++fInSsl;
     if (sslNegotiate(el, fd, privdata, readQueryFromClient, AE_READABLE|AE_READ_THREADSAFE, sslNegotiateWithClient,
                         "sslNegotiateWithClient") == NEGOTIATE_FAILED) {
-        freeClient(c);
+        close(fd);
     }
+    else {
+        after->fn(fd, after->arg);
+    }
+    
+    free(after);
     --fInSsl;
+
 }
 
 #ifdef UNSUPPORTED
@@ -1468,93 +1435,4 @@ sslNegotiateWithoutPostHandshakeHandler(aeEventLoop *el, int fd, void *privdata,
     return sslNegotiate(el, fd, privdata, NULL, AE_NONE, sourceProcedure, sourceProcedureName);
 }
 
-/* =============================================================================
- * Repeated Reads handling
- * ==========================================================================*/
-
-/* 
- * Repeated reads are events that fire when all of the data from an SSL frame is
- * not consumed and their is some left. All of the available data from the socket
- * may have been consumed to read this frame though, so the event loop will not 
- * fire again. 
- *
- * The solution implemented here is a task that will execute in every event loop 
- * iteration and invoke the read handler of any SSL connection for which S2N has 
- * cached application data. */
-static int processRepeatedReads(struct aeEventLoop *eventLoop, long long id, void *clientData) {
-    UNUSED(id);
-    UNUSED(clientData);
-
-    if (!isSSLEnabled()|| listLength(g_ssl_config.sslconn_with_cached_data) == 0) {
-        g_ssl_config.repeated_reads_task_id = AE_ERR;
-        return AE_NOMORE;
-    }
-
-    /* Create a copy of our list so it can be modified arbitrarily during read handler execution */
-    list *copy = listDup(g_ssl_config.sslconn_with_cached_data);
-
-    /* Record maximum list length */
-    if (listLength(copy) > g_ssl_config.max_repeated_read_list_length) {
-        g_ssl_config.max_repeated_read_list_length = listLength(copy);
-    }
-
-    listNode *ln;
-    listIter li;
-
-    listRewind(copy, &li);
-    while((ln = listNext(&li))) {
-        ssl_connection *conn = (ssl_connection*)ln->value;
-        /* If the descriptor is not processing read events, skip it this time and check next time.  It will remain on our list until
-         * drained. */
-        if (aeGetFileEvents(eventLoop, conn->fd) & AE_READABLE) {
-            /* The read handler is expected to remove itself from the repeat read list when there is no longer cached data */
-            aeGetFileProc(eventLoop, conn->fd, AE_READABLE)(eventLoop, conn->fd, aeGetClientData(eventLoop, conn->fd), AE_READABLE);
-            g_ssl_config.total_repeated_reads++;
-        }
-    }
-
-    listRelease(copy);
-
-    if (listLength(g_ssl_config.sslconn_with_cached_data) == 0) {
-        /* No more cached data left */
-        g_ssl_config.repeated_reads_task_id = AE_ERR;
-        return AE_NOMORE;
-    } else {
-        return 0; /* Run as fast as possible without sleeping next time around */
-    }
-}
-
-/* Queue an SSL connection to have its read handler invoked outside of the normal
- * socket notification events in case we do not receive one because there is cached
- * application data inside S2N.  If already queued, will do nothing.  The handler
- * will be repeatedly invoked until removeRepeatedRead is called. */
-static void addRepeatedRead(ssl_connection *conn) {
-    if (conn->cached_data_node != NULL) {
-        return;
-    }
-
-    listAddNodeTail(g_ssl_config.sslconn_with_cached_data, conn);
-    conn->cached_data_node = listLast(g_ssl_config.sslconn_with_cached_data);
-
-    if (g_ssl_config.repeated_reads_task_id == AE_ERR) {
-        /* Schedule the task to process the list */
-        g_ssl_config.repeated_reads_task_id = aeCreateTimeEvent(server.el, 0, processRepeatedReads, NULL, NULL);
-        if (g_ssl_config.repeated_reads_task_id == AE_ERR) {
-            serverLog(LL_WARNING, "Can't create the processRepeatedReads time event.");
-        }
-    }
-}
-
-/* Remove the SSL connection from the queue of repeated read handlers if it exists.
- * One must call this to stop subsequent repeated reads. */
-static void removeRepeatedRead(ssl_connection *conn) {
-    if (conn->cached_data_node == NULL) {
-        return;
-    }
-
-    listDelNode(g_ssl_config.sslconn_with_cached_data, conn->cached_data_node);
-    conn->cached_data_node = NULL;
-
-    /* processRepeatedReads task is responsible for self-terminating when no more reads */
-}
 #endif
